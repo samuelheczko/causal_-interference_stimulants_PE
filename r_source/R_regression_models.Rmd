@@ -1,0 +1,595 @@
+---
+title: "plotting_markdown"
+output: html_document
+date: "2024-01-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Mini project 2: Causal relationship between ADHD stimulant medication and 
+
+
+##initialise the document
+
+```{r intro}
+##imports
+#install.packages("extrafont")
+library(extrafont)
+library(tidyverse)
+library(ggdag)
+library(dagitty)
+library(ggplot2) 
+library(texreg)
+library(cowplot)
+library(cobalt)
+library(geepack)
+
+
+
+
+##LOAD IN DATASET CRETEAD IN PYTHON USING 'raw_data_manipulation.ipynb or .py
+for_regression_130224 <- read_csv("~/Documents/School/phd/mini-projects/Kelleher_block_2/code/data/processed/for_regression_130224.csv")
+
+data_subject_subset <- subset(for_regression_130224, subset_subjects == 1)
+
+
+```
+
+
+##plot DAG 
+
+
+```{r plot dag}
+
+##we start by plotting DAG 
+model_from_dagitty <- dagitty('dag {
+
+"Mental health score" [pos="-1.25,-0.803"]
+"Pyschotic experiences" [outcome,pos="-0.5,-0.297"]
+"Sex" [confounder,pos="-0.75,-0.802"]
+"SEP" [pos="-0.250,-0.803"]
+"Stimulant medication" [exposure,pos="-1.5,-0.293"]
+"Urban Rural" [pos="0.25,-0.803"]
+ADHD [adjusted,pos="-1.75,-0.803"]
+
+"Mental health score" -> "Pyschotic experiences"
+"Mental health score" -> "Stimulant medication"
+"Sex" -> "Pyschotic experiences"
+"Sex" -> "Stimulant medication"
+"SEP" -> "Pyschotic experiences"
+"SEP" -> "Stimulant medication"
+"Stimulant medication" -> "Pyschotic experiences"
+ADHD -> "Pyschotic experiences"
+ADHD -> "Stimulant medication"\
+ADHD -> "Mental health score"
+
+"Urban Rural" -> "Pyschotic experiences"
+"Urban Rural" -> "Stimulant medication"
+
+
+}
+')
+
+ggdag_status(model_from_dagitty,text = FALSE, use_labels = 'name') +
+  theme_dag()
+
+
+ggdag_adjustment_set(model_from_dagitty,use_labels = 'name')
+```
+##prep the data
+
+1. take the subjects that dont have nans in any of the latent factors
+2. make new categorical variable of treatment group membership (at least of one year of stimulant use, no baseline -> done in python earlier)
+
+```{r prep}
+data_subject_subset_1<- data_subject_subset[
+  !is.na(data_subject_subset$ADHD_baseline_year_1_arm_1) & 
+    !is.na(data_subject_subset$PE_3_year_follow_up_y_arm_1) &
+    !is.na(data_subject_subset$PE_baseline_year_1_arm_1) &
+  !is.na(data_subject_subset$CI_average) &
+  !is.na(data_subject_subset$EDU_HIGER_AVERAGE) &
+    !is.na(data_subject_subset$UR_0_baseline_year_1_arm_1)
+  , ]
+
+data_subject_subset_1$TreatmentGroup <- ifelse(data_subject_subset_1$meds_nbl_and_y1_or_y2_and_y3 == 1, TRUE, FALSE)
+
+data_subject_subset_1 %>% 
+  select(Subject,meds_nbl_and_y1_or_y2_and_y3,TreatmentGroup) %>%
+  head(100) #check it works, where meds 0 we should have FALSE and one ie
+
+
+
+```
+
+
+
+##regression model
+
+1. we start by plotting the simple group identity
+
+2. we build a regression model that 
+
+```{r cowplot}
+
+means_PE <- aggregate(PE_3_year_follow_up_y_arm_1 ~  TreatmentGroup, data_subject_subset_1, mean)
+means_ADHD <- aggregate(ADHD_baseline_year_1_arm_1 ~  TreatmentGroup, data_subject_subset_1, mean)
+
+
+
+
+ggplot(data_subject_subset_1, aes(x = TreatmentGroup, y = PE_3_year_follow_up_y_arm_1),
+       ylim =c(0,3)) +
+geom_violin() +
+stat_summary(fun=mean, colour="darkred", geom="point", 
+               shape=18, size=3, show.legend=FALSE  ) + 
+geom_text(data = means_PE, aes(label = PE_3_year_follow_up_y_arm_1, y = PE_3_year_follow_up_y_arm_1 - 1)) +
+cowplot::theme_cowplot(font_size = 11) +
+  coord_cartesian(ylim =c(0,20))  
+
+
+
+ggplot(data_subject_subset_1, aes(x = TreatmentGroup,, y = ADHD_baseline_year_1_arm_1),
+       ylim =c(0,3)) +
+stat_summary(fun=mean, colour="darkred", geom="point", 
+               shape=18, size=3, show.legend=FALSE) + 
+geom_text(data = means_ADHD, aes(label = ADHD_baseline_year_1_arm_1, y = ADHD_baseline_year_1_arm_1 + 12.08)) +
+geom_violin() +
+cowplot::theme_cowplot(font_size = 11)
+#coord_cartesian(ylim =c(0,10))
+
+##regression models
+
+model_naive <- lm(PE_3_year_follow_up_y_arm_1 ~ TreatmentGroup, data = data_subject_subset_1)
+#texreg::screenreg(model_naive)
+summary(model_naive)
+confint(model_naive)
+boxplot(PE_3_year_follow_up_y_arm_1 ~ TreatmentGroup, data = data_subject_subset_1,ylim = c(0,20))
+abline(model_naive, colour = 'blue' )
+
+
+model_compelx <- lm(PE_3_year_follow_up_y_arm_1 ~ Sex_at_birth + ADHD_baseline_year_1_arm_1 + TreatmentGroup + PE_baseline_year_1_arm_1, data = data_subject_subset_1)
+#texreg::screenreg(model_naive)
+summary(model_compelx)
+
+
+```
+
+
+
+## matching model
+
+Here we use the subject matching as our model.
+
+```{r pressure, echo=FALSE}
+
+library(MatchIt)
+
+matched <- matchit(TreatmentGroup ~ Sex_at_birth + ADHD_baseline_year_1_arm_1 + PE_baseline_year_1_arm_1 + CI_average + EDU_HIGER_AVERAGE + UR_0_baseline_year_1_arm_1, data = data_subject_subset_1,
+                    methods = 'full', distance = 'glm', replace = FALSE,ratio = 1)
+matched
+
+data_subject_subset_1_matched <- match.data(matched)
+
+model_matched <- lm(PE_3_year_follow_up_y_arm_1 ~ TreatmentGroup, data = data_subject_subset_1_matched,
+weights = weights)
+texreg::screenreg(model_matched)
+
+```
+```{r ipw}
+
+model_treatment <- glm(TreatmentGroup ~ Sex_at_birth + ADHD_baseline_year_1_arm_1 + PE_baseline_year_1_arm_1 + CI_average + EDU_HIGER_AVERAGE + UR_0_baseline_year_1_arm_1 + anxdisord_baseline_year_1_arm_1 + depress_baseline_year_1_arm_1, data = data_subject_subset_1,
+family = binomial(link = "logit"))
+edu_age_propensities <- broom::augment_columns(model_treatment, data_subject_subset_1,
+type.predict = "response") %>%
+rename(propensity = .fitted)
+
+edu_age_propensities %>%
+select(Subject, TreatmentGroup, Sex_at_birth, ADHD_baseline_year_1_arm_1, PE_baseline_year_1_arm_1,CI_average,propensity) %>%
+arrange(desc(propensity)) %>%
+head(100)
+
+
+df_ipws <- edu_age_propensities %>%
+  mutate(ipw = (TreatmentGroup / propensity) +
+           (1 - TreatmentGroup)/(1 - propensity))
+
+
+
+df_ipws %>%
+select(Subject, TreatmentGroup, Sex_at_birth, ADHD_baseline_year_1_arm_1, PE_baseline_year_1_arm_1,CI_average,anxdisord_baseline_year_1_arm_1, EDU_HIGER_AVERAGE, UR_0_baseline_year_1_arm_1,ipw) %>%
+arrange(desc(ipw)) %>%
+head(100)
+
+ggplot(df_ipws, aes(x = ADHD_baseline_year_1_arm_1, y = EDU_HIGER_AVERAGE,
+color = TreatmentGroup, size = ipw)) +
+geom_point()
+
+
+
+
+model_ipw <- lm(PE_3_year_follow_up_y_arm_1 ~ TreatmentGroup, data = df_ipws,
+weights = ipw)
+texreg::screenreg(model_ipw)
+
+
+```
+```{r}
+df_ipws$weighted <- df_ipws$PE_3_year_follow_up_y_arm_1 * df_ipws$ipw
+
+means_PE <- aggregate(PE_3_year_follow_up_y_arm_1 ~  TreatmentGroup, data_subject_subset_1, mean)
+
+
+ggplot(df_ipws, aes(x = TreatmentGroup, y = weighted),
+       ylim =c(0,3)) +
+geom_violin() +
+#stat_summary(fun=mean, colour="darkred", geom="point", 
+               #shape=18, size=3, show.legend=FALSE  ) + 
+#geom_text(data = means_PE, aes(label = PE_3_year_follow_up_y_arm_1, y = PE_3_year_follow_up_y_arm_1 - 1)) +
+cowplot::theme_cowplot(font_size = 11) #+
+  #coord_cartesian(ylim = c(0,20))
+```
+
+```{r ipw using hernan robins example}
+library("geepack")
+
+
+for_regression_170224 <- read_csv("~/Documents/School/phd/mini-projects/Kelleher_block_2/code/data/processed/for_regression_190224_raw_scores.csv")
+
+data_subject_subset_1702 <- subset(for_regression_170224, subset_subjects == 1)
+
+
+#data_subject_subset_1702 
+data_subject_subset_1702 <- data_subject_subset_1702[
+  !is.na(data_subject_subset_1702$ADHD_baseline_year_1_arm_1) & 
+    !is.na(data_subject_subset_1702$PE_3_year_follow_up_y_arm_1) &
+    #!is.na(data_subject_subset_1702$PE_baseline_year_1_arm_1) &
+  !is.na(data_subject_subset_1702$CI_average) &
+  !is.na(data_subject_subset_1702$EDU_HIGER_AVERAGE) &
+    !is.na(data_subject_subset_1702$UR_0_baseline_year_1_arm_1) &
+    !is.na(data_subject_subset_1702$anxdisord_baseline_year_1_arm_1)&
+    !is.na(data_subject_subset_1702$depress_baseline_year_1_arm_1)
+  , ]
+
+data_subject_subset_1702$TreatmentGroup <- ifelse(data_subject_subset_1702$meds_nbl_and_y1_or_y2_and_y3 == 1, TRUE, FALSE)
+
+
+denom_fit <- glm(
+  TreatmentGroup ~ Sex_at_birth + ADHD_baseline_year_1_arm_1 + #PE_baseline_year_1_arm_1 +
+    CI_average + EDU_HIGER_AVERAGE + UR_0_baseline_year_1_arm_1 + 
+    anxdisord_baseline_year_1_arm_1 + depress_baseline_year_1_arm_1
+  ,
+  family = binomial(),
+  data = data_subject_subset_1702
+)
+
+
+summary(denom_fit)
+
+
+numer_fit <- glm(
+  TreatmentGroup ~ 1, 
+  family = binomial(),
+  data = data_subject_subset_1702
+)
+summary(numer_fit)
+
+
+pd.qsmk <- predict(denom_fit, type = "response")
+
+pn.qsmk <- predict(numer_fit, type = "response")
+
+data_subject_subset_1702$sw <-
+  ifelse(data_subject_subset_1702$TreatmentGroup == 0, ((1 - pn.qsmk) / (1 - pd.qsmk)),
+         (pn.qsmk / pd.qsmk))
+
+
+summary(data_subject_subset_1702$sw)
+
+
+data_subject_subset_1702$Row_ID <- row.names(data_subject_subset_1702)
+
+
+msm.sw <- geeglm(
+  PE_3_year_follow_up_y_arm_1 ~ TreatmentGroup,
+  data = data_subject_subset_1702,
+  weights = sw,
+  id = Row_ID,
+  corstr = "independence"
+)
+
+
+summary(msm.sw)
+
+
+
+```
+```{r}
+
+ggplot(data_subject_subset_1702, aes(x = ADHD_baseline_year_1_arm_1, y = CI_average,
+color = TreatmentGroup, size = sw)) +
+geom_point()
+
+
+xtabs(data_subject_subset_1702$sw ~ data_subject_subset_1702$Sex_at_birth + data_subject_subset_1702$TreatmentGroup)
+
+
+ggplot(data_subject_subset_1702, aes(x = sw, fill = TreatmentGroup)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Comparison of Two Distributions",
+       x = "weight",
+       y = "Density") +
+  scale_fill_manual(values = c("blue", "red")) 
+
+
+```
+```{r}
+data_subject_subset_1702 %>%
+select(Subject, TreatmentGroup, Sex_at_birth, ADHD_baseline_year_1_arm_1, PE_baseline_year_1_arm_1,CI_average,anxdisord_baseline_year_1_arm_1, EDU_HIGER_AVERAGE, UR_0_baseline_year_1_arm_1,sw) %>%
+arrange(desc(sw)) %>%
+head(100)
+
+data_frame_reduct = data_subject_subset_1702 %>%
+select(Subject, TreatmentGroup, Sex_at_birth, ADHD_baseline_year_1_arm_1, PE_baseline_year_1_arm_1,CI_average,anxdisord_baseline_year_1_arm_1, EDU_HIGER_AVERAGE, UR_0_baseline_year_1_arm_1,sw)
+
+means <- aggregate(ADHD_baseline_year_1_arm_1 ~ TreatmentGroup, data = data_subject_subset_1702, FUN = mean)
+
+means_weigted <- aggregate((sw*ADHD_baseline_year_1_arm_1) ~ TreatmentGroup, data = data_subject_subset_1702, FUN = mean)
+
+
+
+print(means)
+print(means_weigted)
+
+ggplot(data_subject_subset_1702, aes(x = sw*ADHD_baseline_year_1_arm_1, fill = TreatmentGroup)) +
+  geom_density(alpha = 0.5) +
+        stat_summary(aes(xintercept = ..x.., y = 0,colour = TreatmentGroup), fun = mean, geom = "vline", orientation = "y") +
+
+  labs(title = "Comparison of Two Distributions",
+       x = "weight * ADHD",
+       y = "Density") +
+  scale_fill_manual(values = c("blue", "red")) 
+
+ggplot(data_subject_subset_1702, aes(x = ADHD_baseline_year_1_arm_1, fill = TreatmentGroup)) +
+  geom_density(alpha = 0.5) +
+    stat_summary(aes(xintercept = ..x.., y = 0,colour = TreatmentGroup), fun = mean, geom = "vline", orientation = "y") +
+  labs(title = "Comparison of unbalanced Distributions",
+       x = "ADHD",
+       y = "Density") +
+  scale_fill_manual(values = c("blue", "red")) 
+
+ggplot(data_subject_subset_1702, aes(y = sw*ADHD_baseline_year_1_arm_1, x = TreatmentGroup)) +
+  geom_boxplot(alpha = 0.5) +
+      stat_summary(aes(xintercept = ..x.., y = 0,colour = TreatmentGroup), fun = mean, geom = "vline", orientation = "y") +
+  labs(title = "Comparison of balanced Distributions",
+       x = "Treatment Group",
+       y = "weighted ADHD_baseline ") +
+  scale_fill_manual(values = c("blue", "red")) 
+
+
+ggplot(data_subject_subset_1702, aes(y = ADHD_baseline_year_1_arm_1, x = TreatmentGroup)) +
+  geom_boxplot(alpha = 0.5) +
+  labs(title = "Comparison of Two Distributions",
+       x = "Treatment Group",
+       y = "unweighted ADHD_baseline ") +
+  scale_fill_manual(values = c("blue", "red")) 
+
+
+
+
+ggplot(data_subject_subset_1702, aes(y = sw*EDU_HIGER_AVERAGE, x = TreatmentGroup)) +
+  geom_boxplot(alpha = 0.5) +
+  labs(title = "Comparison of Two Distributions",
+       x = "Treatment Group",
+       y = "weighted edu ") +
+  scale_fill_manual(values = c("blue", "red")) 
+
+
+ggplot(data_subject_subset_1702, aes(y = EDU_HIGER_AVERAGE, x = TreatmentGroup)) +
+  geom_boxplot(alpha = 0.5) +
+  labs(title = "Comparison of Two Distributions",
+       x = "Treatment Group",
+       y = "edu ") +
+  scale_fill_manual(values = c("blue", "red"))
+
+ggplot(data_subject_subset_1702, aes(y = sw*UR_0_baseline_year_1_arm_1, x = TreatmentGroup)) +
+  geom_boxplot(alpha = 0.5) +
+  labs(title = "Comparison of Two Distributions",
+       x = "Treatment Group",
+       y = "weighted edu ") +
+  scale_fill_manual(values = c("blue", "red")) 
+
+
+ggplot(data_subject_subset_1702, aes(y = UR_0_baseline_year_1_arm_1, x = TreatmentGroup)) +
+  geom_boxplot(alpha = 0.5) +
+  labs(title = "Comparison of Two Distributions",
+       x = "Treatment Group",
+       y = "edu ") +
+  scale_fill_manual(values = c("blue", "red")) 
+
+
+ggplot(data_subject_subset_1702, aes(x = sw, fill = TreatmentGroup)) +
+  geom_histogram(alpha = 0.5) +
+        stat_summary(aes(xintercept = ..x.., y = 0,colour = TreatmentGroup), fun = mean, geom = "vline", orientation = "y") +
+
+  labs(title = "Comparison of Two Distributions",
+       x = "weight",
+       y = "Density") +
+  scale_fill_manual(values = c("blue", "red")) 
+
+
+
+
+```
+```{r}
+##weighted sum 
+print(sum(data_subject_subset_1702$sw * data_subject_subset_1702$ADHD_baseline_year_1_arm_1) / sum(data_subject_subset_1702$sw))
+
+table(data_subject_subset_1702$TreatmentGroup)
+```
+```{r}
+
+
+custom_labels <- c(Sex_at_birth = "Sex at Birth",
+                   ADHD_baseline_year_1_arm_1 = "ADHD at Baseline",
+                   EDU_HIGER_AVERAGE = "Average Education Level",
+                   UR_0_baseline_year_1_arm_1 = "UR at Baseline",
+                   PE_baseline_year_1_arm_1 = "PE at Baseline",
+                   CI_average = "Average CI"
+)
+love.plot(TreatmentGroup ~ Sex_at_birth + ADHD_baseline_year_1_arm_1 + EDU_HIGER_AVERAGE + UR_0_baseline_year_1_arm_1 + PE_baseline_year_1_arm_1 + CI_average,  
+          data = data_subject_subset_1702, 
+          weights = W.out$w,
+          abs = TRUE,
+          line = FALSE, 
+          thresholds = c(m = .1),
+          colors = c("red", "blue"),
+          method = "weighting", estimand = "ATE",
+          var.names = custom_labels)
+
+
+
+bal.tab(W.out, threshold=0.1)
+```
+```{r}
+(sum((data_subject_subset_1702$sw))^2)/(sum((data_subject_subset_1702$sw)^2))
+
+
+(sum((df_ipws$ipw))^2)/(sum((df_ipws$ipw)^2))
+
+
+library(WeightIt)
+W.out <- weightit(TreatmentGroup ~ Sex_at_birth + ADHD_baseline_year_1_arm_1 + PE_baseline_year_1_arm_1 +
+    CI_average + EDU_HIGER_AVERAGE + UR_0_baseline_year_1_arm_1 + 
+    anxdisord_baseline_year_1_arm_1 + depress_baseline_year_1_arm_1,
+                  data = data_subject_subset_1702, estimand = "ATE", method = "gbm", stabilize=FALSE)
+
+summary(W.out)
+
+
+
+msm.sw <- geeglm(
+  PE_3_year_follow_up_y_arm_1 ~ TreatmentGroup,
+  data = data_subject_subset_1702,
+  weights = W.out$weights,
+  id = Row_ID,
+  corstr = "independence"
+)
+
+
+summary(msm.sw)
+
+
+
+(sum((W.out$weights))^2)/(sum((W.out$weights)^2))
+
+```
+```{r final model}
+library(WeightIt)
+library(gbm)
+
+for_regression_200224 <- read_csv("~/Documents/School/phd/mini-projects/Kelleher_block_2/code/data/processed/for_regression_270224_raw_scores.csv") ##read the csv
+
+data_subject_subset_2002 <- subset(for_regression_200224, subset_subjects == 1) ##from the whole data choose the subjects who are in either control group (no stimulants) or treatment (at least of year of stimulant use)
+
+##define the treatment group
+data_subject_subset_2002$TreatmentGroup <- ifelse(data_subject_subset_2002$meds_nbl_and_y1_or_y2_and_y3 == 1, TRUE, FALSE) ##make the treatment group TRUE FALSE COLUMN
+
+
+data_subject_subset_2002$TreatmentGroup_level <- factor(data_subject_subset_2002$TreatmentGroup, levels = unique(data_subject_subset_2002$TreatmentGroup))
+
+
+print('here')
+
+
+summary(data_subject_subset_2002$TreatmentGroup) 
+# Vector of column names to check for NaN values
+
+ ##Define the columns we are going to use from the whole dataset (see the DAG)
+columns_to_check <- c( 
+  "Sex_at_birth",
+  #"Gender_Conformity",
+  "ADHD_baseline_year_1_arm_1",
+  #"ADI_0_baseline_year_1_arm_1",
+  "EDU_HIGER_AVERAGE_squashed",
+  "depress_baseline_year_1_arm_1",
+  "anxdisord_baseline_year_1_arm_1",
+  "somaticpr_baseline_year_1_arm_1",
+  "latent_factor_ss_perinatal_baseline_year_1_arm_1",
+  "race_ethnicity_written",
+  "PE_baseline_year_1_arm_1",
+  "CI_squashed",
+  'UR_0_baseline_year_1_arm_1',
+  #'EDU_HIGER_AVERAGE',
+  
+  ##treatment group
+  'TreatmentGroup',
+  'TreatmentGroup_level',
+  'meds_nbl_and_y1_or_y2_and_y3',
+  
+  ##this is the dependent variable
+  "PE_3_year_follow_up_y_arm_1"
+)
+
+cofactros = columns_to_check[!columns_to_check %in% "PE_3_year_follow_up_y_arm_1"]
+
+#colSums(is.na(data_subject_subset_2002[,cofactros]))
+
+
+# Indexing operation to remove rows with NaN values in specified columns
+data_subject_subset_2002 <- data_subject_subset_2002[complete.cases(data_subject_subset_2002[, columns_to_check]), ]
+
+
+#as.factor(data_subject_subset_2002$race_ethnicity_written)
+
+W.out <- weightit(meds_nbl_and_y1_or_y2_and_y3~ . + CI_squashed * ADHD_baseline_year_1_arm_1 + anxdisord_baseline_year_1_arm_1 * ADHD_baseline_year_1_arm_1,
+                  data = data_subject_subset_2002[,cofactros], estimand = "ATT", method = "gbm", stabilize=TRUE,thresholds = c(m = .1),trim.at = 0 ,focal = 1.0) 
+
+
+##gbm = Generalized Boosted Models
+
+
+```
+
+```{r}
+ your_treatment_variable = (data_subject_subset_2002$TreatmentGroup)
+
+levels(your_treatment_variable)
+factor(your_treatment_variable, levels = unique(your_treatment_variable))
+
+```
+
+
+```{r}
+library(cobalt)
+library(geepack)
+summary(W.out)
+love.plot(TreatmentGroup ~ ., 
+          data = data_subject_subset_2002[,cofactros],
+          weights = W.out$w,
+          abs = FALSE,
+          line = FALSE, 
+          thresholds = c(m = .1),
+          colors = c("red", "blue"),
+          method = "weighting", estimand = "ATE")
+
+
+data_subject_subset_2002$Row_ID <- row.names(data_subject_subset_2002)
+
+msm.sw <- geeglm(
+  PE_3_year_follow_up_y_arm_1 ~ TreatmentGroup,
+  data = data_subject_subset_2002,
+  weights = W.out$weights,
+  id = Row_ID,
+  corstr = "independence"
+)
+
+summary(msm.sw)
+
+```
+```{r}
+summary(W.out)
+```
+
+
